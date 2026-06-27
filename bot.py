@@ -197,11 +197,50 @@ async def _safe_scan(row) -> None:
 
 async def _announce(acc: QuestAccount, q: Quest, row) -> None:
     await db.record_completion(row["id"], q.id, q.name)
-    total = await db.count_for_account(row["id"])
-    await dm(row["discord_user_id"],
-             f"🎉 เควสเสร็จ! บัญชี **{acc.username}** ทำ **{q.name}** สำเร็จ "
-             f"(บัญชีนี้รวม {total} เควสแล้ว)")
     log.info(f"✅ {acc.username}: {q.name}")
+    await update_completion_embed(row["discord_user_id"])
+
+
+async def build_completion_embed(uid: int) -> discord.Embed:
+    rows = await db.recent_completions(uid, 12)
+    total = await db.user_completion_total(uid)
+    e = discord.Embed(title="🎉 เควสที่ทำเสร็จแล้ว", color=0x57F287,
+                      timestamp=discord.utils.utcnow())
+    if not rows:
+        e.description = "ยังไม่มีเควสเสร็จ"
+        return e
+    e.description = "\n".join(
+        f"✅ **{r['quest_name']}** · `{r['username']}` · <t:{int(r['completed_at'].timestamp())}:R>"
+        for r in rows)
+    e.set_footer(text=f"รวมทั้งหมด {total} เควส • อัปเดตล่าสุด")
+    return e
+
+
+async def update_completion_embed(uid: int) -> None:
+    """แทนการ DM ทุกเควส → embed เดียวที่สะสมรายการ + bump DM ขึ้นบนแล้วลบให้คลีน"""
+    try:
+        user = bot.get_user(uid) or await bot.fetch_user(uid)
+        dm_ch = user.dm_channel or await user.create_dm()
+        embed = await build_completion_embed(uid)
+        ref = await db.get_notify_msg(uid)
+        msg = None
+        if ref:
+            try:
+                msg = await dm_ch.fetch_message(ref["message_id"])
+            except (discord.NotFound, discord.Forbidden):
+                msg = None
+        if msg:
+            await msg.edit(embed=embed)
+            try:   # bump: เด้ง DM ขึ้นบน + แจ้งเตือน แล้วลบให้เหลือแค่ embed
+                bump = await dm_ch.send("🎉 เควสใหม่เสร็จแล้ว!")
+                await bump.delete()
+            except Exception:
+                pass
+        else:
+            msg = await dm_ch.send(embed=embed)
+            await db.set_notify_msg(uid, dm_ch.id, msg.id)
+    except Exception as e:
+        log.warning(f"completion embed {uid}: {e}")
 
 
 async def run_video(acc: QuestAccount, q: Quest, row) -> None:

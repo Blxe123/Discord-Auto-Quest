@@ -135,7 +135,13 @@ panels (
 user_prefs (
   discord_user_id BIGINT PK, presence_enabled BOOLEAN DEFAULT TRUE
 )  -- เปิด/ปิด presence บนโปรไฟล์ รายคน (toggle ผ่านปุ่ม 👁️)
+notify_msgs (
+  discord_user_id BIGINT PK, channel_id BIGINT, message_id BIGINT
+)  -- embed สรุปเควสเสร็จ 1 อันต่อคน (ไว้แก้ซ้ำ ไม่ DM รัวๆ)
 ```
+
+> **แจ้งเตือนเควสเสร็จ:** ไม่ DM ทุกครั้ง — ใช้ **embed เดียวต่อคน** (`update_completion_embed`)
+> แก้ embed สะสมรายการ (recent 12 + total, relative time) แล้วส่งข้อความ bump → ลบ เพื่อเด้ง DM ขึ้นบน + คลีน
 
 - **Leaderboard** = group by `discord_user_id`, นับ completions รวมทุก token ของคนนั้น
 - `user_rank()` คืนอันดับของคนๆ นั้น, `global_stats()` คืน (accounts, users, quests)
