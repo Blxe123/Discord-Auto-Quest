@@ -14,6 +14,7 @@ ENV (Railway → Variables):
 from __future__ import annotations
 
 import os
+import random
 import asyncio
 import logging
 
@@ -53,6 +54,7 @@ class QuestBot(commands.Bot):
         self.session: aiohttp.ClientSession | None = None
         self.farm_tasks: dict[tuple[int, str], asyncio.Task] = {}   # วิดีโอ (ต่อ quest)
         self.game_workers: dict[int, asyncio.Task] = {}             # เกม (ต่อ account)
+        self._pres_i = 0                                            # index สลับสถานะ
 
     async def setup_hook(self) -> None:
         self.session = aiohttp.ClientSession()
@@ -67,6 +69,7 @@ class QuestBot(commands.Bot):
             await self.tree.sync()
         self.autofarm.start()
         self.refresh_panels.start()
+        self.rotate_presence.start()
 
     async def close(self) -> None:
         for t in (*self.farm_tasks.values(), *self.game_workers.values()):
@@ -107,6 +110,25 @@ class QuestBot(commands.Bot):
 
     @refresh_panels.before_loop
     async def _before_refresh(self) -> None:
+        await self.wait_until_ready()
+
+    # ── สลับสถานะบอทให้ดูมีชีวิต (ดึงสถิติสด) ─────────────────
+    @tasks.loop(seconds=30)
+    async def rotate_presence(self) -> None:
+        try:
+            stats = await db.global_stats()
+        except Exception:
+            stats = None
+        statuses = build_statuses(stats, farming_count())
+        act, st = statuses[self._pres_i % len(statuses)]
+        self._pres_i += 1
+        try:
+            await self.change_presence(activity=act, status=st)
+        except Exception as e:
+            log.warning(f"presence: {e}")
+
+    @rotate_presence.before_loop
+    async def _before_presence(self) -> None:
         await self.wait_until_ready()
 
 
@@ -215,6 +237,28 @@ def farming_count() -> int:
     """จำนวนเควสที่กำลัง farm อยู่ตอนนี้ (เกม + วิดีโอ)"""
     videos = len([t for t in bot.farm_tasks.values() if not t.done()])
     return len(bot.game_workers) + videos
+
+
+# สถานะหมุนของบอท (BOT โชว์ได้แค่ type+name +url สำหรับ streaming — ไม่มี GIF/details/state)
+_TWITCH = "https://www.twitch.tv/gaxiapx"
+
+
+def build_statuses(stats, farming: int):
+    q = stats["quests"] if stats else 0
+    a = stats["accounts"] if stats else 0
+    W, L, C = (discord.ActivityType.watching, discord.ActivityType.listening,
+               discord.ActivityType.competing)
+    online = discord.Status.online
+    return [
+        (discord.Streaming(name="🎮 farming quests 24/7", url=_TWITCH), online),
+        (discord.Activity(type=W, name=f"{farming} เควสกำลัง farm 🔥"), online),
+        (discord.Game(name="Discord Quests 🎯"), online),
+        (discord.Activity(type=W, name=f"{a} บัญชีในระบบ 👥"), online),
+        (discord.Activity(type=C, name="🏆 quest leaderboard"), online),
+        (discord.Activity(type=L, name="heartbeat 💓 ทุก 90 วิ"), online),
+        (discord.Game(name=f"farm ไปแล้ว {q} เควส 🚜"), online),
+        (discord.Streaming(name="กด /setup_panel เริ่มเลย", url=_TWITCH), online),
+    ]
 
 
 def panel_embed(stats=None, farming: int = 0) -> discord.Embed:
