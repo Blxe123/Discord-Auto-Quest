@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import random
+import time
 import asyncio
 import logging
 
@@ -32,6 +33,7 @@ from discord.ext import commands, tasks
 
 from quest_api import QuestAccount, Quest
 from db import DB, decrypt
+from presence import PresenceManager
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
@@ -41,8 +43,10 @@ BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
 OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)
 GUILD_ID = int(os.getenv("GUILD_ID", "0") or 0)
 FARM_INTERVAL = int(os.getenv("FARM_INTERVAL_MIN", "10") or 10)
+ENABLE_PRESENCE = os.getenv("ENABLE_PRESENCE", "1").strip().lower() not in ("0", "false", "no", "off")
 
 db = DB()
+PRESENCE: PresenceManager | None = None   # ตั้งใน setup_hook ถ้า ENABLE_PRESENCE
 
 
 # ════════════════════════════════════════════════════════════════
@@ -54,12 +58,17 @@ class QuestBot(commands.Bot):
         self.session: aiohttp.ClientSession | None = None
         self.farm_tasks: dict[tuple[int, str], asyncio.Task] = {}   # วิดีโอ (ต่อ quest)
         self.game_workers: dict[int, asyncio.Task] = {}             # เกม (ต่อ account)
+        self.farm_state: dict[int, dict] = {}                       # สถานะสด: {current, queue}
         self._pres_i = 0                                            # index สลับสถานะ
 
     async def setup_hook(self) -> None:
         self.session = aiohttp.ClientSession()
         await db.connect()
         log.info("✓ database connected")
+        global PRESENCE
+        if ENABLE_PRESENCE:
+            PRESENCE = PresenceManager(self.session)
+            log.info("✓ presence เปิด (โชว์เควสบนโปรไฟล์ user ระหว่าง farm)")
         self.add_view(PanelView())            # ปุ่มทำงานต่อได้แม้บอท restart
         if GUILD_ID:
             g = discord.Object(id=GUILD_ID)
@@ -74,6 +83,8 @@ class QuestBot(commands.Bot):
     async def close(self) -> None:
         for t in (*self.farm_tasks.values(), *self.game_workers.values()):
             t.cancel()
+        if PRESENCE:
+            await PRESENCE.close()
         if self.session:
             await self.session.close()
         await db.close()
@@ -206,7 +217,8 @@ async def run_video(acc: QuestAccount, q: Quest, row) -> None:
 
 
 async def game_worker(acc: QuestAccount, row) -> None:
-    """ไล่ทำเควสเกมทีละอันจนหมด — เครดิตจริงตามเวลา (~15 นาที/เควส)"""
+    """ไล่ทำเควสเกมทีละอันจนหมด — อัปเดต farm_state (current+queue) + presence ระหว่างทำ"""
+    aid = row["id"]
     try:
         while True:
             quests = await acc.list_quests()
@@ -214,11 +226,31 @@ async def game_worker(acc: QuestAccount, row) -> None:
             if not pending:
                 break
             q = pending[0]
+            bot.farm_state[aid] = {
+                "current": {"name": q.name, "done": q.progress, "target": q.target},
+                "queue": [p.name for p in pending[1:]],
+            }
+            start_ms = int(time.time() * 1000)
             log.info(f"🎮 {acc.username}: เริ่มเควสเกม {q.name} ({q.progress}/{q.target}s)")
+            pres_on = bool(PRESENCE) and await db.get_presence_pref(row["discord_user_id"])
+            if pres_on:
+                try:
+                    await PRESENCE.set_quest(acc.token, q.name, q.app_id, q.progress, q.target, start_ms)
+                except Exception as e:
+                    log.debug(f"presence start: {e}")
 
-            async def prog(done, target, _name=q.name):
-                if done % 60 < 3:   # log ทุก ~1 นาที
+            async def prog(done, target, _aid=aid, _name=q.name, _tok=acc.token,
+                           _app=q.app_id, _s=start_ms, _on=pres_on):
+                stt = bot.farm_state.get(_aid)
+                if stt and stt.get("current"):
+                    stt["current"]["done"] = done
+                if done % 60 < 3:
                     log.info(f"🎮 {acc.username}: {_name} {done}/{target}s")
+                if _on and PRESENCE:
+                    try:
+                        await PRESENCE.set_quest(_tok, _name, _app, done, target, _s)
+                    except Exception:
+                        pass
 
             try:
                 if await acc.farm_game(q, on_progress=prog):
@@ -230,13 +262,28 @@ async def game_worker(acc: QuestAccount, row) -> None:
                 log.error(f"game {acc.username}/{q.name}: {e}")
                 break
     finally:
-        bot.game_workers.pop(row["id"], None)
+        bot.farm_state.pop(aid, None)
+        if PRESENCE:
+            try:
+                await PRESENCE.clear(acc.token)
+            except Exception:
+                pass
+        bot.game_workers.pop(aid, None)
 
 
 def farming_count() -> int:
     """จำนวนเควสที่กำลัง farm อยู่ตอนนี้ (เกม + วิดีโอ)"""
     videos = len([t for t in bot.farm_tasks.values() if not t.done()])
     return len(bot.game_workers) + videos
+
+
+def _progbar(pct: int, width: int = 10) -> str:
+    filled = max(0, min(width, round(width * pct / 100)))
+    return "█" * filled + "░" * (width - filled)
+
+
+def _vids_running(account_id: int) -> int:
+    return sum(1 for (a, _), t in bot.farm_tasks.items() if a == account_id and not t.done())
 
 
 # สถานะหมุนของบอท (BOT โชว์ได้แค่ type+name +url สำหรับ streaming — ไม่มี GIF/details/state)
@@ -362,10 +409,27 @@ class PanelView(discord.ui.View):
         e = discord.Embed(title="📊 สถานะบัญชีของคุณ", color=0x5865F2)
         for r in rows:
             cnt = await db.count_for_account(r["id"])
-            busy = " · 🚜 กำลัง farm" if r["id"] in bot.game_workers else ""
             state = "🟢" if r["active"] else f"🔴 {r['last_error'] or 'ปิดใช้'}"
-            e.add_field(name=f"{state} {r['username']}",
-                        value=f"ทำไปแล้ว **{cnt}** เควส{busy}", inline=False)
+            parts = [f"✅ ทำไปแล้ว **{cnt}** เควส"]
+            st = bot.farm_state.get(r["id"])
+            if st and st.get("current"):
+                c = st["current"]
+                pct = int(c["done"] * 100 / c["target"]) if c["target"] else 0
+                parts.append(f"🚜 **กำลังทำ:** {c['name']}\n"
+                             f"`{_progbar(pct)}` {c['done']}/{c['target']}s ({pct}%)")
+                queue = st.get("queue") or []
+                if queue:
+                    shown = ", ".join(queue[:6])
+                    extra = f" +{len(queue) - 6}" if len(queue) > 6 else ""
+                    parts.append(f"⏳ **คิว ({len(queue)}):** {shown}{extra}")
+            vids = _vids_running(r["id"])
+            if vids:
+                parts.append(f"📺 วิดีโอกำลังทำ: **{vids}**")
+            if not (st and st.get("current")) and not vids:
+                parts.append("💤 ไม่มีเควสค้าง")
+            e.add_field(name=f"{state} {r['username']}", value="\n".join(parts), inline=False)
+        pref = await db.get_presence_pref(interaction.user.id)
+        e.set_footer(text=f"👁️ Presence โปรไฟล์: {'เปิด ✅' if pref else 'ปิด 🚫'} · กดปุ่ม 👁️ เพื่อสลับ")
         await interaction.followup.send(embed=e, ephemeral=True)
 
     @discord.ui.button(label="ลบ Token", emoji="🗑️",
@@ -433,6 +497,32 @@ class PanelView(discord.ui.View):
                 "6️⃣ กลับมากด ➕ **เพิ่ม Token** → วาง → เสร็จ!\n\n"
                 "🔐 token เก็บแบบเข้ารหัส · ⚠️ อย่าบอก token ใคร = เข้าบัญชีคุณได้เลย"))
         await interaction.response.send_message(embed=e, ephemeral=True)
+
+    @discord.ui.button(label="Presence โปรไฟล์", emoji="👁️",
+                       style=discord.ButtonStyle.secondary, custom_id="panel:presence", row=2)
+    async def presence_toggle(self, interaction: discord.Interaction, _btn: discord.ui.Button):
+        """เปิด/ปิด แสดงเควสบนโปรไฟล์ตัวเอง (รายคน)"""
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        uid = interaction.user.id
+        new = not await db.get_presence_pref(uid)
+        await db.set_presence_pref(uid, new)
+        if not new and PRESENCE:   # ปิด → เคลียร์ presence บัญชีของคนนี้ทันที
+            for r in await db.all_active_accounts():
+                if r["discord_user_id"] == uid:
+                    try:
+                        await PRESENCE.clear(decrypt(r["token_enc"]))
+                    except Exception:
+                        pass
+        note = "" if PRESENCE else "\n_(ระบบ presence ปิดทั้งระบบอยู่ — `ENABLE_PRESENCE=0`)_"
+        if new:
+            await interaction.followup.send(
+                "👁️ **เปิด** presence แล้ว — โปรไฟล์บัญชีคุณจะโชว์เควสที่กำลังทำ + progress "
+                "(เริ่มในรอบ farm ถัดไป)\n⚠️ บัญชีจะออนไลน์ broadcast = เสี่ยงแบนขึ้น" + note,
+                ephemeral=True)
+        else:
+            await interaction.followup.send(
+                "🚫 **ปิด** presence แล้ว — โปรไฟล์จะไม่โชว์เควส (farm เงียบๆ เหมือนเดิม)" + note,
+                ephemeral=True)
 
 
 # ════════════════════════════════════════════════════════════════

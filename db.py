@@ -60,6 +60,10 @@ CREATE TABLE IF NOT EXISTS panels (
     channel_id BIGINT      NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE TABLE IF NOT EXISTS user_prefs (
+    discord_user_id  BIGINT  PRIMARY KEY,
+    presence_enabled BOOLEAN NOT NULL DEFAULT TRUE   -- โชว์เควสบนโปรไฟล์ตัวเองไหม (รายคน)
+);
 """
 
 
@@ -180,3 +184,18 @@ class DB:
     async def remove_panel(self, message_id: int) -> None:
         async with self.pool.acquire() as c:
             await c.execute("DELETE FROM panels WHERE message_id=$1", message_id)
+
+    # ── user preferences ────────────────────────────────────────
+    async def get_presence_pref(self, discord_user_id: int) -> bool:
+        """โชว์ presence บนโปรไฟล์ไหม (default เปิด)"""
+        async with self.pool.acquire() as c:
+            v = await c.fetchval(
+                "SELECT presence_enabled FROM user_prefs WHERE discord_user_id=$1", discord_user_id)
+        return True if v is None else bool(v)
+
+    async def set_presence_pref(self, discord_user_id: int, enabled: bool) -> None:
+        async with self.pool.acquire() as c:
+            await c.execute(
+                "INSERT INTO user_prefs (discord_user_id, presence_enabled) VALUES ($1,$2) "
+                "ON CONFLICT (discord_user_id) DO UPDATE SET presence_enabled=$2",
+                discord_user_id, enabled)
