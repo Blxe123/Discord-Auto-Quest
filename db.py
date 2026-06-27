@@ -64,6 +64,11 @@ CREATE TABLE IF NOT EXISTS user_prefs (
     discord_user_id  BIGINT  PRIMARY KEY,
     presence_enabled BOOLEAN NOT NULL DEFAULT TRUE   -- โชว์เควสบนโปรไฟล์ตัวเองไหม (รายคน)
 );
+CREATE TABLE IF NOT EXISTS notify_msgs (
+    discord_user_id BIGINT PRIMARY KEY,              -- embed สรุปเควสเสร็จ (1 อันต่อคน, ไว้แก้ซ้ำ)
+    channel_id      BIGINT NOT NULL,
+    message_id      BIGINT NOT NULL
+);
 """
 
 
@@ -199,3 +204,29 @@ class DB:
                 "INSERT INTO user_prefs (discord_user_id, presence_enabled) VALUES ($1,$2) "
                 "ON CONFLICT (discord_user_id) DO UPDATE SET presence_enabled=$2",
                 discord_user_id, enabled)
+
+    # ── notify embed (สรุปเควสเสร็จ ต่อคน) ───────────────────────
+    async def get_notify_msg(self, uid: int) -> asyncpg.Record | None:
+        async with self.pool.acquire() as c:
+            return await c.fetchrow(
+                "SELECT channel_id, message_id FROM notify_msgs WHERE discord_user_id=$1", uid)
+
+    async def set_notify_msg(self, uid: int, channel_id: int, message_id: int) -> None:
+        async with self.pool.acquire() as c:
+            await c.execute(
+                "INSERT INTO notify_msgs (discord_user_id, channel_id, message_id) VALUES ($1,$2,$3) "
+                "ON CONFLICT (discord_user_id) DO UPDATE SET channel_id=$2, message_id=$3",
+                uid, channel_id, message_id)
+
+    async def recent_completions(self, uid: int, limit: int = 12) -> list[asyncpg.Record]:
+        async with self.pool.acquire() as c:
+            return await c.fetch(
+                "SELECT a.username, c.quest_name, c.completed_at "
+                "FROM completions c JOIN accounts a ON a.id=c.account_id "
+                "WHERE a.discord_user_id=$1 ORDER BY c.completed_at DESC LIMIT $2", uid, limit)
+
+    async def user_completion_total(self, uid: int) -> int:
+        async with self.pool.acquire() as c:
+            return await c.fetchval(
+                "SELECT COUNT(*) FROM completions c JOIN accounts a ON a.id=c.account_id "
+                "WHERE a.discord_user_id=$1", uid) or 0
